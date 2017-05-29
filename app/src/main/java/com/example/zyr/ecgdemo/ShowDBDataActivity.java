@@ -1,0 +1,541 @@
+package com.example.zyr.ecgdemo;
+
+import android.app.AlertDialog;
+import android.content.ContentValues;
+import android.content.DialogInterface;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.database.Cursor;
+import android.database.sqlite.SQLiteDatabase;
+import android.net.ConnectivityManager;
+import android.net.NetworkInfo;
+import android.os.AsyncTask;
+import android.os.Handler;
+import android.os.Message;
+import android.support.v7.app.AppCompatActivity;
+import android.os.Bundle;
+import android.view.View;
+import android.widget.AbsListView;
+import android.widget.ArrayAdapter;
+import android.widget.Button;
+import android.widget.EditText;
+import android.widget.LinearLayout;
+import android.widget.ListView;
+import android.widget.Toast;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public class ShowDBDataActivity extends AppCompatActivity {
+
+    //layout related vars
+    private StringBuffer showBuffer;
+    private static String url_user;
+    private static String url_user_temp;
+    private static String url_user_search;
+    private static String DBname;
+    private static String startTime ;
+    private static String endTime ;
+    private static String startValue;
+    private static String endValue;
+    private static String setHour;
+    private static String setMin;
+    //other vars
+    private static PostService mService;
+    private static NetworkUtility mNetwork;
+    private static int flag = 0; //used in calling different loadMore method depends on querying from time or value
+    private final static int queryFromTime = 1;
+    private final static int queryFromValue = 2;
+    private final static int queryFromServer = 3;
+
+    //ListView related vars
+    private ArrayAdapter<String> mAdapter;
+    private LinearLayout mProgressLayout;
+    private ListView mLoadView;
+    //Adapter's data source
+    private List<String> mDataList;
+    //next batch of data
+    private List<String> mMoreData;
+    private int mStartIndex = 0;
+    //numbers of a batch of data
+    private int mMaxCount = 10;
+    private static int mTotalDataNum = -1;
+
+    //Handle UI About Data Form Server
+    private Handler queryFromServerHandler = new Handler(){
+        public void handleMessage(Message msg) {
+            System.out.println("message is : " + msg);
+            MyDatabaseHelper dpHelper = new MyDatabaseHelper(ShowDBDataActivity.this, DBname, null, 1);
+            parseJsonAndSaveData(msg.obj.toString() , dpHelper);
+            displayDataFromServer();
+        }
+    };
+
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_show_dbdata);
+        //Basic layout init (except the ListView)
+        final EditText startTimeView = (EditText)findViewById(R.id.start_time);
+        final EditText endTimeView = (EditText)findViewById(R.id.stop_time);
+        final EditText startValueView = (EditText)findViewById(R.id.start_value);
+        final EditText endValueView = (EditText)findViewById(R.id.end_value);
+
+        Button mqueryViaTimeButton = (Button)findViewById(R.id.query_from_button);
+        Button mqueryFromServerButton = (Button)findViewById(R.id.query_from_server_button);
+        Button muploadButton = (Button)findViewById(R.id.upload_button);
+        Button mqueryViaValueButton = (Button)findViewById(R.id.query_via_value);
+        Button mClearButton = (Button)findViewById(R.id.clear_button);
+
+        //Ohter vars init
+        String username = readData();
+        url_user = "http://104.236.126.112/api/user/" + username;
+        url_user_temp = url_user + "/temp";
+        url_user_search = url_user + "/search";
+        mNetwork = new NetworkUtility();
+        mService = new PostService();
+        DBname = username + ".db";
+        final MyDatabaseHelper myDB = new MyDatabaseHelper(ShowDBDataActivity.this, DBname, null, 1);
+        showBuffer = new StringBuffer();
+
+        //Button Responses
+        mqueryViaTimeButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                //set mAdapter = null, so every time button's clicked, the listview would be recreated
+                mAdapter = null;
+                flag = queryFromTime;
+                startTime = startTimeView.getText().toString();
+                endTime = endTimeView.getText().toString();
+                mTotalDataNum = getTotalNumOfDataViaDate("userData", myDB, startTime, endTime);
+                initListView();
+                initData();
+            }
+        });
+
+        mqueryViaValueButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                mAdapter = null;
+                flag = queryFromValue;
+                startValue = startValueView.getText().toString();
+                endValue = endValueView.getText().toString();
+                mTotalDataNum = getTotalNumOfDataViaValue("userData", myDB,startValue, endValue);
+                initListView();
+                initData();
+            }
+        });
+
+        mqueryFromServerButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                createserverDataTable(myDB);
+                startTime = startTimeView.getText().toString();
+                endTime = endTimeView.getText().toString();
+                mNetwork.queryFromServer(url_user_search, startTime, endTime, new HttpCallbackListener() {
+                    @Override
+                    public void onFinish(String response, Message message) {
+                        queryFromServerHandler.sendMessage(message);
+                    }
+
+                    @Override
+                    public void onError(Exception e) {
+
+                    }
+                });
+            }
+        });
+
+        muploadButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if(isNetworkAvailable()){
+                    if (isWiFi()){
+                        System.out.println("Upload will be initiated immediately using WiFi");
+                        //Upload directly
+                        Toast.makeText(getApplicationContext(), "Uploading initiated, please do not exit before its been completed", Toast.LENGTH_SHORT).show();
+                        initiateUploadService();
+                    }
+                    else if(isMobile()){
+                        //System.out.println("Mobile Data Connected.");
+
+                        //Ask user if he/she want to use data to upload
+                        ifUseMobileToUpload(myDB);
+
+                    }
+                }else {
+                    //setNetwork
+                    setNetwork();
+                }
+                mService.setCount(0);
+                //mService.clearJsonArray();
+            }
+        });
+
+        mClearButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                ArrayAdapter adapter = (ArrayAdapter) mLoadView.getAdapter();// 获取当前listview的adapter
+                int count = adapter.getCount();// listview多少个组件
+                if (count > 0) {
+                    mLoadView.setAdapter(new ArrayAdapter<String>(ShowDBDataActivity.this,
+                            android.R.layout.simple_list_item_1));
+                }
+            }
+        });
+    }
+
+    /**
+     *The method is used for getting total number of the records in a table, with certain condition satisfied
+     * specifically, 'time >= ? AND time <=' here
+     */
+    private int getTotalNumOfDataViaDate(String TableName, MyDatabaseHelper dbHelper, String startTime, String endTime){
+        int TotalDataNum = -1;
+        SQLiteDatabase db = dbHelper.getWritableDatabase();
+        //set argus for db.query()method, 7 needed
+        String[] columns = new String[]{
+                "time",
+                "value"
+        };
+        String whereClause ="time >= ? AND time <= ?";
+        //give value to "?" in whereClause
+        String[] whereArgs = new String[]{
+                startTime,
+                endTime
+        };
+        String orderBy = "time";
+        Cursor cursor = db.query(TableName,columns,whereClause,whereArgs,null,null,orderBy);
+        //Table Traversal
+        if (cursor.moveToFirst()){
+            do {
+                TotalDataNum +=1;
+            }while(cursor.moveToNext());
+        }
+        cursor.close();
+        return TotalDataNum;
+    }
+    /**
+     *The method is used for getting total number of the records in a table, with certain condition satisfied
+     * specifically, 'value >= ? AND value <= ?' here
+     */
+    private int getTotalNumOfDataViaValue(String TableName, MyDatabaseHelper dbHelper, String startValue, String endValue){
+        SQLiteDatabase db = dbHelper.getWritableDatabase();
+        int TotalNum = -1;
+        String[] columns = new String[]{
+                "time",
+                "value"
+        };
+        String whereClause ="value >= ? AND value <= ?";
+        String[] whereArgs = new String[]{
+                startValue,
+                endValue
+        };
+        String orderBy = "value";
+        Cursor cursor = db.query(TableName,columns,whereClause,whereArgs,null,null,orderBy);
+        if (cursor.moveToFirst()){
+            do {
+                TotalNum += 1;
+            }while(cursor.moveToNext());
+        }
+        cursor.close();
+        return TotalNum;
+    }
+    //Init ListView
+    private void initListView(){
+        //ListView's efficiency can still be optimized with further work
+        mProgressLayout = (LinearLayout)findViewById(R.id.ll_progress);
+        mLoadView = (ListView) findViewById(R.id.show_database_data);
+
+        mLoadView.setOnScrollListener(new AbsListView.OnScrollListener() {
+            @Override
+            public void onScrollStateChanged(AbsListView view, int scrollState) {
+                switch (scrollState){
+                    case SCROLL_STATE_IDLE://when scrolling stopped
+                        int position = mLoadView.getLastVisiblePosition();
+                        if(position == mDataList.size() - 1 && position != mTotalDataNum -1){
+                            //if current bottom is the last loaded data, load more
+                            mStartIndex += mMaxCount;
+                            LoadDataTask mLoadDataTask = new LoadDataTask();
+                            mLoadDataTask.execute();
+                        }else if(position == mDataList.size() - 1 && position == mTotalDataNum - 1){
+                            //if all the data in the adapter has been loaded
+                            Toast.makeText(getApplicationContext(),"No more Data",Toast.LENGTH_SHORT).show();
+                        }
+                        break;
+                    case SCROLL_STATE_TOUCH_SCROLL://scrolling with finger, not needed in this case
+                        break;
+                    case SCROLL_STATE_FLING://scrolling without finger, not needed in this case
+
+                        break;
+                }
+            }
+
+            @Override
+            public void onScroll(AbsListView view, int firstVisibleItem, int visibleItemCount, int totalItemCount) {
+                //actions when user is scrolling the ListView, not needed in this case
+            }
+        });
+    }
+
+    //Init Data for the very first time when the query button's been pressed
+    private void initData(){
+        mDataList = new ArrayList<>();
+        mMoreData = new ArrayList<>();
+        LoadDataTask mLoadDataTask = new LoadDataTask();
+        mLoadDataTask.execute();
+    }
+    //Wrap database's data into a jsonObject for upload
+
+    private void initiateUploadService(){
+        Intent intent = new Intent(this, UploadService.class);
+        startService(intent);
+    }
+    /**
+     * This method is used for querying from server. After the server send back data,
+     * the method would be called to parse the Json data and save it one by one into a
+     *  local temp table(named 'serverData') within the database
+     */
+    private void parseJsonAndSaveData(String jsonData, MyDatabaseHelper dpHelper){
+        try {
+            JSONArray jsonArray = new JSONArray(jsonData);
+            SQLiteDatabase db = dpHelper.getWritableDatabase();
+            for (int i = 0; i < jsonArray.length(); i++) {
+                //Parse JsonArray
+                JSONObject jsonObject = jsonArray.getJSONObject(i);
+                //String Id = jsonObject.getString("No");
+                String value = jsonObject.getString("value");
+                String time = jsonObject.getString("time");
+                //String value2 = jsonObject.getString("value2");
+
+                //Save Data into a new Table serverData
+                ContentValues values = new ContentValues();
+                values.put("time", time);
+                values.put("value", value);
+                db.insert("serverData", null, values);
+            }
+            db.close();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void displayDataFromServer(){
+        mAdapter = null;//set Adapter to null, so every time the method been called,the listview will refresh
+        flag = queryFromServer;
+        initListView();
+        initData();
+    }
+
+    /**
+     * Pop a AlertDialog to ask user if he/she wants to use mobile data to upload
+     */
+    private void ifUseMobileToUpload(final MyDatabaseHelper dbHelper){
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setTitle("Do you want to use mobile data to upload ?");
+        builder.setMessage("Continue upload?");
+        builder.setPositiveButton("Yes", new DialogInterface.OnClickListener() {
+            @Override
+            public void onClick(DialogInterface dialog, int which) {
+                Toast.makeText(getApplicationContext(), "Uploading via Data", Toast.LENGTH_SHORT).show();
+                initiateUploadService();
+            }
+        });
+
+        builder.setNegativeButton("No", new DialogInterface.OnClickListener() {
+            @Override
+            public void onClick(DialogInterface dialog, int which) {
+                Toast.makeText(getApplicationContext(), "Upload canceled", Toast.LENGTH_SHORT).show();
+            }
+        });
+        builder.create();
+        builder.show();
+    }
+
+    /**
+     * Pop a AlertDialog to ask user to setup the network(to open wifi in this method)
+     */
+    private void setNetwork(){
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setTitle("Please Set Your Network");
+        builder.setMessage("Continue?");
+        builder.setPositiveButton("Setup", new DialogInterface.OnClickListener() {
+            @Override
+            public void onClick(DialogInterface dialog, int which) {
+                Intent intent = null;
+                intent = new Intent(android.provider.Settings.ACTION_WIFI_SETTINGS);
+                startActivity(intent);
+            }
+        });
+
+        builder.setNegativeButton("Cancel", new DialogInterface.OnClickListener() {
+            @Override
+            public void onClick(DialogInterface dialog, int which) {
+                Toast.makeText(getApplicationContext(), "Network is not available now", Toast.LENGTH_SHORT).show();
+            }
+        });
+        builder.create();
+        builder.show();
+    }
+
+    private void setClock(String hour, String minute){
+        mService.setSetHour(hour);
+        mService.setSetMin(minute);
+    }
+
+    private boolean isNetworkAvailable(){
+        ConnectivityManager cm = (ConnectivityManager) this.getSystemService(CONNECTIVITY_SERVICE);
+
+        NetworkInfo activeNetwork = cm.getActiveNetworkInfo();
+        boolean isConnected = activeNetwork != null && activeNetwork.isConnectedOrConnecting();
+        return isConnected;
+    }
+
+    /**
+     * To check if the phone is using a Wifi now
+     */
+    private boolean isWiFi(){
+        ConnectivityManager cm = (ConnectivityManager) this.getSystemService(CONNECTIVITY_SERVICE);
+        NetworkInfo activeNetwork = cm.getActiveNetworkInfo();
+        boolean isWiFi = activeNetwork.getType() == ConnectivityManager.TYPE_WIFI;
+        return isWiFi;
+    }
+
+    /**
+     * To check if the phone is using Mobile data now
+     */
+    private boolean isMobile(){
+        ConnectivityManager cm = (ConnectivityManager) this.getSystemService(this.CONNECTIVITY_SERVICE);
+        NetworkInfo activeNetwork = cm.getActiveNetworkInfo();
+        boolean isMobile = activeNetwork.getType() == ConnectivityManager.TYPE_MOBILE;
+        return isMobile;
+    }
+    /**
+     * To read from sharedPreferences file , specifically, to get the username
+     */
+    private String readData(){
+        SharedPreferences pref = getSharedPreferences("UserName", MODE_PRIVATE);
+        return pref.getString("username","");
+    }
+
+    private void createserverDataTable(MyDatabaseHelper dbHelper){
+        final String CREATE_TABLE = "create table if not exists serverData("
+                + "_id integer primary key autoincrement, "
+                + "time text, "
+                + "value real)";
+        SQLiteDatabase db = dbHelper.getWritableDatabase();
+        if (ifTableExists(dbHelper, "serverTable")){
+            db.delete("serverData", null, null);
+        }else{
+            db.execSQL(CREATE_TABLE);
+        }
+    }
+
+    private boolean ifTableExists(MyDatabaseHelper dbHelper, String tableName){
+        boolean result = false;
+        try{
+            SQLiteDatabase db = dbHelper.getReadableDatabase();
+            Cursor cursor = db.rawQuery("select count(*) as c from sqlite_master where type = 'table' and name = '" + tableName.trim() + "' ", null);
+            if (cursor.moveToNext()){
+                int count = cursor.getInt(0);
+                if (count > 0) result = true;
+            }
+        }catch (Exception e){
+            e.printStackTrace();
+        }
+        return result;
+    }
+    /**
+     * The LoadDataTask extends a AsyncTask, it opens a background Thread for the ListView to dynamically
+     * load data from a table in the Database
+     */
+    class LoadDataTask extends AsyncTask<Void, Void, List<String>> {
+        private MyDatabaseHelper dbHelper = new MyDatabaseHelper(ShowDBDataActivity.this, DBname, null, 1);
+
+        @Override
+        protected void onPreExecute(){
+            mProgressLayout.setVisibility(View.VISIBLE);
+        }
+
+        @Override
+        protected List<String> doInBackground(Void... params){
+            //use a flag to ID three different types of loading actions
+            switch (flag){
+                case queryFromTime:
+                    mMoreData = loadMoreViaDate(dbHelper, "userData", mStartIndex, mMaxCount);
+                    break;
+                case queryFromValue:
+                    mMoreData = loadMoreViaValue(dbHelper, "userData", mStartIndex, mMaxCount);
+                    break;
+                case queryFromServer:
+                    mMoreData = loadMorefromServerData(dbHelper, mStartIndex, mMaxCount);
+                    break;
+            }
+            return  mMoreData;
+        }
+
+        @Override
+        protected void onPostExecute(List<String> strings){
+            //Hide the ProgressBar
+            mProgressLayout.setVisibility(View.INVISIBLE);
+            //Add new data into adapter's data source
+            mDataList.addAll(mMoreData);
+            if(mAdapter == null){
+                mAdapter = new ArrayAdapter<String>(ShowDBDataActivity.this, android.R.layout.simple_list_item_1, mDataList);
+                mLoadView.setAdapter(mAdapter);
+            }else{
+                mAdapter.notifyDataSetChanged();
+            }
+        }
+
+        private List<String> loadMoreViaDate(MyDatabaseHelper dpHelper, String TableName, int startIndex, int maxCount){
+            SQLiteDatabase db = dpHelper.getReadableDatabase();
+            Cursor cursor = db.rawQuery("select time,value from "+ TableName + " where time >= ? AND time <= ? order by time limit ? offset ?"
+                    , new String[]{startTime, endTime, String.valueOf(maxCount), String.valueOf(startIndex)});
+            List<String> moreDataList = new ArrayList<>();
+            if (cursor.moveToFirst())
+                do {
+                    String data = cursor.getString(cursor.getColumnIndex("time")) + "  Value: "
+                            + cursor.getString(cursor.getColumnIndex("value"));
+                    moreDataList.add(data);
+                }while(cursor.moveToNext());
+            cursor.close();
+            db.close();
+            return moreDataList;
+        }
+        private List<String> loadMoreViaValue(MyDatabaseHelper dpHelper, String TableName, int startIndex, int maxCount){
+            SQLiteDatabase db = dpHelper.getReadableDatabase();
+            Cursor cursor = db.rawQuery("select time,value from "+ TableName + " where value >= ? AND value <= ? order by value limit ? offset ?"
+                    , new String[]{startValue, endValue, String.valueOf(maxCount), String.valueOf(startIndex)});
+            List<String> moreDataList = new ArrayList<>();
+            if (cursor.moveToFirst())
+                do {
+                    String data = cursor.getString(cursor.getColumnIndex("time")) + "  Value:"
+                            + cursor.getString(cursor.getColumnIndex("value"));
+                    moreDataList.add(data);
+                }while(cursor.moveToNext());
+            cursor.close();
+            db.close();
+            return moreDataList;
+        }
+
+        private List<String> loadMorefromServerData(MyDatabaseHelper dpHelper, int startIndex, int maxCount){
+            SQLiteDatabase db = dpHelper.getReadableDatabase();
+            Cursor cursor = db.rawQuery("select time,value from serverData order by time limit ? offset ?"
+                    , new String[]{String.valueOf(maxCount), String.valueOf(startIndex)});
+            List<String> moreDataList = new ArrayList<>();
+            if (cursor.moveToFirst())
+                do {
+                    String data = cursor.getString(cursor.getColumnIndex("time")) + "  Value:"
+                            + cursor.getString(cursor.getColumnIndex("value"));
+                    moreDataList.add(data);
+                }while(cursor.moveToNext());
+            cursor.close();
+            db.close();
+            return moreDataList;
+        }
+    }
+}
